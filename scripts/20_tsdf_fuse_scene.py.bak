@@ -1,0 +1,99 @@
+import os, argparse, glob
+from pathlib import Path
+import numpy as np
+import torch
+import open3d as o3d
+import cv2
+
+from src.models.unet_depth import UNetDepth
+from src.utils.geom import read_pincam, to_o3d_intrinsics
+from src.utils.io import load_rgb
+from src.utils.io import load_traj_map
+
+from src.utils.traj_lookup import lookup_Twc
+def load_model(ckpt_path: str, device: str):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    m = UNetDepth(in_ch=3, base=32).to(device)
+    m.load_state_dict(ckpt["model"], strict=True)
+    m.eval()
+    return m
+
+def rgb_to_tensor(rgb: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(rgb).float().permute(2,0,1).unsqueeze(0) / 255.0
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", required=True, help=".../ChallengeDevelopmentSet")
+    ap.add_argument("--scene_id", required=True)
+    ap.add_argument("--checkpoint", required=True, help="runs/.../best.pt")
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--max_frames", type=int, default=120)
+    ap.add_argument("--stride", type=int, default=3)
+    ap.add_argument("--voxel", type=float, default=0.02, help="TSDF voxel size in meters")
+    ap.add_argument("--trunc", type=float, default=0.08, help="TSDF truncation in meters")
+    args = ap.parse_args()
+
+    scene = Path(args.root)/args.scene_id
+    rgb_dir = scene/"lowres_wide"
+    intr_dir = scene/"lowres_wide_intrinsics"
+    traj_path = scene/"lowres_wide.traj"
+
+    out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
+
+    traj_map = load_traj_map(str(traj_path))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = load_model(args.checkpoint, device)
+
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=float(args.voxel),
+        sdf_trunc=float(args.trunc),
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+    )
+
+    rgb_paths = []
+    for ext in ("png","jpg","jpeg","PNG","JPG","JPEG"):
+        rgb_paths += glob.glob(str(rgb_dir/f"*.{ext}"))
+    rgb_paths = sorted(rgb_paths)
+    used = 0
+    for i, rp in enumerate(rgb_paths[::args.stride]):
+        if used >= args.max_frames:
+            break
+        ts = Path(rp).stem
+        Twc = lookup_Twc(traj_map, ts, tol=1e-3)
+        if Twc is None:
+            continue
+        intr_path = intr_dir/f"{ts}.pincam"
+        if not intr_path.exists():
+            continue
+
+        rgb = load_rgb(rp)
+        H, W = rgb.shape[:2]
+        # predict depth (meters)
+        with torch.no_grad():
+            pred = model(rgb_to_tensor(rgb).to(device)).cpu().numpy()[0,0]
+        # Open3D expects depth image scaled by depth_scale (default 1000) when constructing RGBDImage;
+        # we will create an Image with float depth in meters and set depth_scale=1.0.
+        rgb_o3d = o3d.geometry.Image(rgb.astype(np.uint8))
+        depth_o3d = o3d.geometry.Image(pred.astype(np.float32))
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            rgb_o3d, depth_o3d, depth_scale=1.0, depth_trunc=10.0, convert_rgb_to_intensity=False
+        )
+
+        intr = to_o3d_intrinsics(read_pincam(str(intr_path)))
+        # Twc provided by lookup_Twc
+# camera-to-world
+        extr = np.linalg.inv(Twc)               # Open3D extrinsic is world-to-camera
+        volume.integrate(rgbd, intr, extr)
+        used += 1
+        if used % 10 == 0:
+            print(f"[integrate] {used}/{args.max_frames}")
+
+    mesh = volume.extract_triangle_mesh()
+    mesh.compute_vertex_normals()
+    out_mesh = out/f"{args.scene_id}_mesh.ply"
+    o3d.io.write_triangle_mesh(str(out_mesh), mesh)
+    print(f"[OK] saved {out_mesh} (frames_used={used})")
+
+if __name__ == "__main__":
+    main()

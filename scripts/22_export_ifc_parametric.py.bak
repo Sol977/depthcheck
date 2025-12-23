@@ -1,0 +1,164 @@
+import argparse, json
+from pathlib import Path
+
+import ifcopenshell
+import ifcopenshell.api
+
+
+def api_run_compat(model, usecase: str, **kw):
+    """
+    IfcOpenShell API version compatibility shim:
+    - Some usecases expect `product=...`, others expect `products=[...]`
+    - We'll try the given kwargs first, then retry with normalized forms.
+    """
+    try:
+        return ifcopenshell.api.run(usecase, model, **kw)
+    except TypeError as e:
+        # Normalize common patterns
+        if usecase in ("aggregate.assign_object", "spatial.assign_container"):
+            if "product" in kw and "products" not in kw:
+                prod = kw.pop("product")
+                kw["products"] = [prod]
+                return ifcopenshell.api.run(usecase, model, **kw)
+        if usecase == "geometry.edit_object_placement":
+            if "product" in kw and "products" not in kw:
+                prod = kw.pop("product")
+                kw["products"] = [prod]
+                return ifcopenshell.api.run(usecase, model, **kw)
+        raise e
+
+
+def assign_units_meters(model):
+    # Your environment expects: unit.assign_unit(file, length={...})
+    try:
+        return api_run_compat(model, "unit.assign_unit", length={"unit": "METRE"})
+    except Exception:
+        # If it still fails, proceed without explicit unit (won't crash the pipeline)
+        return None
+
+
+def add_basic_spatial_structure(model):
+    project = api_run_compat(model, "root.create_entity", ifc_class="IfcProject", name="RGB2BIM")
+    assign_units_meters(model)
+
+    # contexts (Body)
+    context = api_run_compat(model, "context.add_context", context_type="Model")
+    body = api_run_compat(
+        model,
+        "context.add_context",
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=context,
+    )
+
+    site = api_run_compat(model, "root.create_entity", ifc_class="IfcSite", name="Site")
+    building = api_run_compat(model, "root.create_entity", ifc_class="IfcBuilding", name="Building")
+    storey = api_run_compat(model, "root.create_entity", ifc_class="IfcBuildingStorey", name="Level 0")
+
+    # placements (keep it minimal; API handles default placement)
+    api_run_compat(model, "geometry.edit_object_placement", product=site)
+    api_run_compat(model, "geometry.edit_object_placement", product=building)
+    api_run_compat(model, "geometry.edit_object_placement", product=storey)
+
+    # aggregate: Project > Site > Building > Storey
+    api_run_compat(model, "aggregate.assign_object", relating_object=project, products=[site])
+    api_run_compat(model, "aggregate.assign_object", relating_object=site, products=[building])
+    api_run_compat(model, "aggregate.assign_object", relating_object=building, products=[storey])
+
+    return project, site, building, storey, body
+
+
+def polygon_area_xy(poly):
+    pts = poly[:]
+    if pts[0] != pts[-1]:
+        pts.append(pts[0])
+    a = 0.0
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
+        a += x1 * y2 - x2 * y1
+    return 0.5 * a
+
+
+def ensure_ccw(poly):
+    return list(reversed(poly)) if polygon_area_xy(poly) < 0 else poly
+
+
+def make_extruded_solid(model, body_context, poly_xy, z0, height):
+    # poly_xy: list of [x,y]
+    poly_xy = ensure_ccw(poly_xy)
+    if poly_xy[0] != poly_xy[-1]:
+        poly_xy = poly_xy + [poly_xy[0]]
+
+    pts = [model.create_entity("IfcCartesianPoint", (float(x), float(y))) for x, y in poly_xy]
+    polyline = model.create_entity("IfcPolyline", pts)
+    profile = model.create_entity("IfcArbitraryClosedProfileDef", "AREA", None, polyline)
+
+    origin = model.create_entity("IfcCartesianPoint", (0.0, 0.0, float(z0)))
+    axis2 = model.create_entity("IfcAxis2Placement3D", origin, None, None)
+    dirz = model.create_entity("IfcDirection", (0.0, 0.0, 1.0))
+
+    solid = model.create_entity("IfcExtrudedAreaSolid", profile, axis2, dirz, float(height))
+    shape = model.create_entity("IfcShapeRepresentation", body_context, "Body", "SweptSolid", [solid])
+    rep = model.create_entity("IfcProductDefinitionShape", None, None, [shape])
+    return rep
+
+
+def iter_planes(planes_obj):
+    # supports either {"planes":[...]} or [...] format
+    if isinstance(planes_obj, dict):
+        if isinstance(planes_obj.get("planes"), list):
+            return planes_obj["planes"]
+    if isinstance(planes_obj, list):
+        return planes_obj
+    return []
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--planes_json", required=True)
+    ap.add_argument("--out_ifc", required=True)
+    ap.add_argument("--default_wall_height", type=float, default=2.8)
+    ap.add_argument("--default_slab_thickness", type=float, default=0.20)
+    args = ap.parse_args()
+
+    planes = json.loads(Path(args.planes_json).read_text(encoding="utf-8"))
+    model = ifcopenshell.file(schema="IFC4")
+
+    project, site, building, storey, body = add_basic_spatial_structure(model)
+
+    n_added = 0
+    for i, pl in enumerate(iter_planes(planes)):
+        n = pl.get("normal")
+        hull = pl.get("hull_xy") or pl.get("hull")
+        if n is None or hull is None or len(hull) < 3:
+            continue
+
+        nx, ny, nz = map(float, n)
+        z0 = float(pl.get("z0", 0.0))
+        nz_abs = abs(nz)
+
+        if nz_abs > 0.85:
+            thickness = float(pl.get("thickness", args.default_slab_thickness))
+            rep = make_extruded_solid(model, body, hull, z0, thickness)
+            slab = api_run_compat(model, "root.create_entity", ifc_class="IfcSlab", name=f"Slab_{i}")
+            slab.Representation = rep
+            api_run_compat(model, "spatial.assign_container", products=[slab], relating_structure=storey)
+            n_added += 1
+        else:
+            height = float(pl.get("height", args.default_wall_height))
+            rep = make_extruded_solid(model, body, hull, z0, height)
+            wall = api_run_compat(model, "root.create_entity", ifc_class="IfcWall", name=f"Wall_{i}")
+            wall.Representation = rep
+            api_run_compat(model, "spatial.assign_container", products=[wall], relating_structure=storey)
+            n_added += 1
+
+    out_path = Path(args.out_ifc)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    model.write(str(out_path))
+    print(f"[OK] wrote {out_path} elements={n_added}")
+
+
+if __name__ == "__main__":
+    main()
